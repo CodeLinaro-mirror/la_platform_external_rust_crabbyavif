@@ -75,6 +75,10 @@ impl FileTypeBox {
             "avis",
             #[cfg(feature = "heic")]
             "heic",
+            #[cfg(feature = "heic")]
+            "heix",
+            #[cfg(feature = "heic")]
+            "mif1",
         ])
     }
 
@@ -83,6 +87,10 @@ impl FileTypeBox {
             "avif",
             #[cfg(feature = "heic")]
             "heic",
+            #[cfg(feature = "heic")]
+            "heix",
+            #[cfg(feature = "heic")]
+            "mif1",
         ])
     }
 
