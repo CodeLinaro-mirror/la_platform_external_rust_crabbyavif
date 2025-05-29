@@ -33,6 +33,8 @@ macro_rules! conversion_function {
 conversion_function!(usize_from_u64, usize, u64);
 conversion_function!(usize_from_u32, usize, u32);
 conversion_function!(usize_from_u16, usize, u16);
+#[cfg(feature = "sample_transform")]
+conversion_function!(usize_from_u8, usize, u8);
 #[cfg(feature = "android_mediacodec")]
 conversion_function!(usize_from_isize, usize, isize);
 conversion_function!(u64_from_usize, u64, usize);
@@ -76,7 +78,7 @@ clamp_function!(clamp_i32, i32);
 macro_rules! round2_function {
     ($func:ident, $type:ty) => {
         pub(crate) fn $func(value: $type) -> $type {
-            if value % 2 == 0 {
+            if value % 2 == 0 || value == <$type>::MAX {
                 value
             } else {
                 value + 1
@@ -252,10 +254,13 @@ pub(crate) fn validate_grid_image_dimensions(image: &Image, grid: &Grid) -> Avif
     //   - when the images are in the 4:2:0 chroma sampling format both the horizontal and
     //     vertical tile offsets and widths, and the output width and height, shall be even
     //     numbers.
-    if ((image.yuv_format == PixelFormat::Yuv420 || image.yuv_format == PixelFormat::Yuv422)
-        && (grid.width % 2 != 0 || image.width % 2 != 0))
-        || (image.yuv_format == PixelFormat::Yuv420
-            && (grid.height % 2 != 0 || image.height % 2 != 0))
+    // Do not perform this validation when HEIC is enabled. There are several HEIC files in the
+    // wild which do not conform to this constraint.
+    if !cfg!(feature = "heic")
+        && (((image.yuv_format == PixelFormat::Yuv420 || image.yuv_format == PixelFormat::Yuv422)
+            && (grid.width % 2 != 0 || image.width % 2 != 0))
+            || (image.yuv_format == PixelFormat::Yuv420
+                && (grid.height % 2 != 0 || image.height % 2 != 0)))
     {
         return Err(AvifError::InvalidImageGrid(format!(
             "Grid image width ({}) or height ({}) or tile width ({}) or height ({}) shall be \

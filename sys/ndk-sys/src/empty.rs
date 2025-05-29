@@ -12,18 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Not all sub-modules are used by all targets. Ignore dead code warnings.
-#![allow(dead_code)]
-
-pub(crate) mod jpeg;
-pub(crate) mod png;
-pub(crate) mod y4m;
-
-use crabby_avif::image::Image;
-use crabby_avif::AvifResult;
-
-use std::fs::File;
-
-pub trait Writer {
-    fn write_frame(&mut self, file: &mut File, image: &Image) -> AvifResult<()>;
-}
+// Empty file on purpose. See ../build.rs.
