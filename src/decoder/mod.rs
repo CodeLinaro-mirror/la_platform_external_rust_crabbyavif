@@ -393,7 +393,7 @@ pub enum CompressionFormat {
 }
 
 pub(crate) struct GridImageHelper<'a> {
-    grid: &'a Grid,
+    grid: &'a mut Grid,
     image: &'a mut Image,
     pub category: Category,
     pub cell_index: usize,
@@ -402,6 +402,7 @@ pub(crate) struct GridImageHelper<'a> {
     first_cell_image: Option<Image>,
     tile_width: u32,
     tile_height: u32,
+    grid_tile_cache: GridTileCache,
 }
 
 // These functions are not used in all configurations.
@@ -409,6 +410,40 @@ pub(crate) struct GridImageHelper<'a> {
 impl GridImageHelper<'_> {
     pub(crate) fn is_grid_complete(&self) -> AvifResult<bool> {
         Ok(self.cell_index == self.expected_cell_count)
+    }
+
+    pub(crate) fn image_dimensions(&self) -> (u32, u32) {
+        (self.image.width, self.image.height)
+    }
+
+    pub(crate) fn is_tile_size_aligned_to(&self, alignment: u32) -> bool {
+        self.tile_width % alignment == 0 && self.tile_height % alignment == 0
+    }
+
+    pub(crate) fn update_grid_tile_for_row_mode(&mut self) -> AvifResult<()> {
+        self.grid_tile_cache.cache(self.grid.rows, self.grid.columns, self.tile_width, self.tile_height);
+        self.tile_width = checked_mul!(self.tile_width, self.grid.columns)?;
+        self.grid.columns = 1;
+        // update_grid_by_row() is invoked during the initialization phase, before decoding begins.
+        // At this point, cell_index has not been incremented and remains at its initial value
+        // (previous_decoded_tile_count).
+        self.expected_cell_count = self.cell_index +
+            checked_mul!(self.grid.rows, self.grid.columns)? as usize;
+
+        Ok(())
+    }
+
+    pub(crate) fn reset_grid_tile_if_cached(&mut self) -> AvifResult<()> {
+        if (self.grid_tile_cache.is_cached) {
+            self.tile_width = self.grid_tile_cache.tile_width;
+            self.grid.columns = self.grid_tile_cache.grid_columns;
+            self.grid_tile_cache.is_cached = false;
+            self.expected_cell_count = self.cell_index +
+                checked_mul!(self.grid.rows, self.grid.columns)? as usize;
+
+        }
+
+        Ok(())
     }
 
     pub(crate) fn copy_from_cell_image(&mut self, cell_image: &mut Image) -> AvifResult<()> {
@@ -1800,7 +1835,7 @@ impl Decoder {
             };
             payloads.push(data.to_vec());
         }
-        let grid = &self.tile_info[decoding_item.usize()].grid;
+        let grid = &mut self.tile_info[decoding_item.usize()].grid;
         // If we are not doing incremental decode, all the cells must have been read.
         if !self.settings.allow_incremental
             && checked_mul!(grid.rows, grid.columns)? != payloads.len() as u32
@@ -1823,6 +1858,7 @@ impl Decoder {
             first_cell_image: None,
             tile_width: first_tile.width,
             tile_height: first_tile.height,
+            grid_tile_cache: GridTileCache::default(),
         };
         let codec = &mut self.codecs[first_tile.codec_index];
         let next_image_result = codec.get_next_image_grid(
