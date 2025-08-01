@@ -475,3 +475,23 @@ pub struct Nclx {
 }
 
 pub const MAX_AV1_LAYER_COUNT: usize = 4;
+
+use log::{Level, LevelFilter};
+use logger::Config;
+use std::sync::Once;
+
+static LOGGER_INIT: Once = Once::new();
+
+#[inline]
+pub fn init_logger() {
+    if cfg!(target_os = "android") {
+        LOGGER_INIT.call_once(|| {
+            #[cfg(target_os = "android")]
+            let _ = logger::init(
+                Config::default()
+                .with_tag_on_device("CrabbyAvif")
+                .with_max_level(LevelFilter::Debug),
+            );
+        });
+    }
+}

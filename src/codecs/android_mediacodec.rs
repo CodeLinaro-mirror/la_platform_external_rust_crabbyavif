@@ -23,11 +23,16 @@ use crate::internal_utils::stream::IStream;
 use crate::internal_utils::*;
 use crate::*;
 
+use atrace::{trace_method, AtraceTag};
+use log::{info, debug, warn, error};
+
 use ndk_sys::bindings::*;
 
-use std::ffi::CString;
+use std::ffi::{CString, CStr};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
 
 #[cfg(android_soong)]
 include!(concat!(env!("OUT_DIR"), "/mediaimage2_bindgen.rs"));
@@ -370,6 +375,29 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     }
 }
 
+// HEIF mode constants
+#[derive(Debug, Copy, Clone, PartialEq)]
+#[repr(i32)]
+enum HeifMode {
+    None = 0,
+    Tile = 1,
+    Row = 2,
+}
+
+// row-by-row decode feature name constant
+const FEATURE_ROW_BY_ROW: &str = "heic-row-by-row-decode";
+
+// Messages for thread communication in grid decoding
+#[derive(Debug)]
+enum ThreadMessage {
+    Error(AvifError),
+    ExitSignal,
+}
+
+// Thread-safe wrapper for MediaCodec pointer
+struct ThreadSafeMediaCodec(*mut AMediaCodec);
+unsafe impl Send for ThreadSafeMediaCodec {}
+
 #[derive(Default)]
 pub struct MediaCodec {
     codec: Option<*mut AMediaCodec>,
@@ -386,7 +414,12 @@ impl MediaCodec {
     const MAX_RETRIES: u32 = 100;
     const TIMEOUT: u32 = 10000;
 
-    fn initialize_impl(&mut self, low_latency: bool) -> AvifResult<()> {
+    fn initialize_impl(
+        &mut self,
+        low_latency: bool,
+        is_grid: bool,
+        grid_image_helper: Option<&mut GridImageHelper>
+    ) -> AvifResult<()> {
         let config = self.config.unwrap_ref();
         if self.codec_index >= self.codec_initializers.len() {
             return Err(AvifError::NoCodecAvailable);
@@ -455,6 +488,85 @@ impl MediaCodec {
             unsafe { AMediaFormat_delete(format) };
             return Err(AvifError::NoCodecAvailable);
         }
+
+        unsafe {
+            if !is_grid {
+                // No grid mode, single tile
+                c_str!(
+                    qti_thumbnail_mode_str,
+                    qti_thumbnail_mode_str_tmp,
+                    "vendor.qti-ext-dec-thumbnail-mode.value"
+                );
+                c_str!(
+                    thumbnail_mode_str,
+                    thumbnail_mode_str_tmp,
+                    "thumbnail-mode"
+                );
+                c_str!(
+                    num_input_buffers_str,
+                    num_input_buffers_str_tmp,
+                    "android._num-input-buffers"
+                );
+                c_str!(
+                    num_output_buffers_str,
+                    num_output_buffers_str_tmp,
+                    "android._num-output-buffers"
+                );
+                AMediaFormat_setInt32(format, qti_thumbnail_mode_str, 1);
+                AMediaFormat_setInt32(format, thumbnail_mode_str, 1);
+                AMediaFormat_setInt32(format, num_input_buffers_str, 1);
+                AMediaFormat_setInt32(format, num_output_buffers_str, 1);
+            } else if config.codec_config.is_heic() {
+                // grid + heif
+                let helper = match grid_image_helper {
+                    Some(h) => h,
+                    None => {
+                        error!("invalid grid image helper");
+                        return Err(AvifError::UnknownError(format!(
+                            "invalid grid image helper"
+                        )));
+                    }
+                };
+                c_str!(
+                    qti_heif_mode_str,
+                    qti_heif_mode_str_tmp,
+                    "vendor.qti-ext-dec-heif-mode.value"
+                );
+                let heif_mode = {
+                    let mut name_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+                    if helper.is_tile_size_aligned_to(512) &&
+                            AMediaCodec_getName(codec, &mut name_ptr) == media_status_t_AMEDIA_OK &&
+                            !name_ptr.is_null() {
+                        let codec_name = CStr::from_ptr(name_ptr).to_str().unwrap();
+                        let support = Self::is_feature_support_static(codec_name,
+                                FEATURE_ROW_BY_ROW);
+                        AMediaCodec_releaseName(codec, name_ptr);
+                        if support { HeifMode::Row } else { HeifMode::Tile }
+                    } else {
+                        HeifMode::Tile
+                    }
+                };
+                AMediaFormat_setInt32(format, qti_heif_mode_str, heif_mode as i32);
+                if heif_mode == HeifMode::Row {
+                    let (width, height) = helper.image_dimensions();
+                    c_str!(
+                        qti_heif_res_width_str,
+                        qti_heif_res_width_str_tmp,
+                        "vendor.qti-ext-heif-resolution.width"
+                    );
+                    c_str!(
+                        qti_heif_res_height_str,
+                        qti_heif_res_height_str_tmp,
+                        "vendor.qti-ext-heif-resolution.height"
+                    );
+                    AMediaFormat_setInt32(format, qti_heif_res_width_str, width as i32);
+                    AMediaFormat_setInt32(format, qti_heif_res_height_str, height as i32);
+                    info!("Setting HEIF mode {} resolution {}x{}", heif_mode as i32, width, height);
+                    helper.update_grid_by_row();
+                }
+            } // else -> grid non heif (maybe avif)
+        }
+
         let status =
             unsafe { AMediaCodec_configure(codec, format, ptr::null_mut(), ptr::null_mut(), 0) };
         if status != media_status_t_AMEDIA_OK {
@@ -543,6 +655,22 @@ impl MediaCodec {
 
     fn enqueue_payload(&self, input_index: isize, payload: &[u8], flags: u32) -> AvifResult<()> {
         let codec = self.codec.unwrap();
+        Self::enqueue_payload_static(
+            codec,
+            input_index,
+            payload, flags,
+            &self.config.unwrap_ref().codec_config
+        )
+    }
+
+    // Static version of enqueue_payload for use in threads
+    fn enqueue_payload_static(
+        codec: *mut AMediaCodec,
+        input_index: isize,
+        payload: &[u8],
+        flags: u32,
+        codec_config: &crate::parser::mp4box::CodecConfiguration,
+    ) -> AvifResult<()> {
         let mut input_buffer_size: usize = 0;
         let input_buffer = unsafe {
             AMediaCodec_getInputBuffer(
@@ -556,7 +684,8 @@ impl MediaCodec {
                 "input buffer at index {input_index} was null"
             )));
         }
-        let hevc_whole_nal_units = self.hevc_whole_nal_units(payload)?;
+
+        let hevc_whole_nal_units = Self::hevc_whole_nal_units_static(payload, codec_config)?;
         let codec_payload = match &hevc_whole_nal_units {
             Some(hevc_payload) => hevc_payload,
             None => payload,
@@ -585,6 +714,112 @@ impl MediaCodec {
         Ok(())
     }
 
+    // Input thread main function
+    fn input_thread_entry(
+        codec: ThreadSafeMediaCodec,
+        payloads: Vec<Vec<u8>>,
+        output_tx: mpsc::Sender<ThreadMessage>,
+        output_rx: mpsc::Receiver<ThreadMessage>,
+        codec_config: crate::parser::mp4box::CodecConfiguration,
+    ) -> AvifResult<()> {
+        info!("Input thread started");
+
+        let codec_ptr = codec.0;
+        let last_payload_index = payloads.len() - 1;
+        for (payload_index, payload) in payloads.iter().enumerate() {
+            loop {
+                let input_index = unsafe {
+                    AMediaCodec_dequeueInputBuffer(codec_ptr, Self::TIMEOUT as _)
+                };
+                if input_index >= 0 {
+                    if let Err(e) = Self::enqueue_payload_static(
+                            codec_ptr,
+                            input_index,
+                            payload,
+                            if payload_index == last_payload_index {
+                                AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32
+                            } else {
+                                0
+                            },
+                            &codec_config) {
+                        let _ = output_tx.send(ThreadMessage::Error(e));
+                        return Err(AvifError::UnknownError("Failed to enqueue payload".into()));
+                    }
+                    break;
+                } else {
+                    match output_rx.try_recv() {
+                        Ok(ThreadMessage::ExitSignal) => {
+                            info!("Input thread received exit signal, terminating");
+                            return Ok(());
+                        }
+                        Ok(ThreadMessage::Error(e)) => {
+                            error!("Input thread received error signal: {:?}", e);
+                            return Err(e);
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            error!("Main thread disconnected");
+                            return Err(AvifError::UnknownError("Main thread disconnected".into()));
+                        }
+                        Err(_) => { /* Nothing to do, ignore */ }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Static version of hevc_whole_nal_units for use in threads
+    fn hevc_whole_nal_units_static(
+        payload: &[u8],
+        codec_config: &crate::parser::mp4box::CodecConfiguration
+    ) -> AvifResult<Option<Vec<u8>>> {
+        if !codec_config.is_heic() {
+            return Ok(None);
+        }
+        // For HEVC, MediaCodec expects whole NAL units with each unit prefixed with a start code
+        // of "\x00\x00\x00\x01".
+        let nal_length_size = codec_config.nal_length_size() as usize;
+        let mut offset = 0;
+        let mut hevc_payload = Vec::new();
+        while offset < payload.len() {
+            let payload_slice = &payload[offset..];
+            let mut stream = IStream::create(payload_slice);
+            let nal_length = usize_from_u64(stream.read_uxx(nal_length_size as u8)?)?;
+            let nal_unit_end = checked_add!(nal_length, nal_length_size)?;
+            let nal_unit_range = nal_length_size..nal_unit_end;
+            check_slice_range(payload_slice.len(), &nal_unit_range)?;
+            // Start code.
+            hevc_payload.extend_from_slice(&[0, 0, 0, 1]);
+            // NAL Unit.
+            hevc_payload.extend_from_slice(&payload_slice[nal_unit_range]);
+            offset = checked_add!(offset, nal_unit_end)?;
+        }
+        Ok(Some(hevc_payload))
+    }
+
+    // Check if a specific feature is supported by given codec
+    fn is_feature_support_static(codec_name: &str, feature_name: &str) -> bool {
+        // TODO: Due to NDK limitations, it's not possible to query detailed vendor capability info;
+        // only standard AOSP features can be checked via API AMediaCodecInfo_isFeatureSupported().
+        // Therefore, this function relies on an AOSP change to add vendor feature into AOSP.
+        // Another potential solution is to introduce the jni crate and query detailed vendor
+        // capability infos through Java APIs, but this requires more changes.
+        let codec_name_cstr = CString::new(codec_name).unwrap();
+        let feature_name_cstr = CString::new(feature_name).unwrap();
+        let mut codec_info: *const AMediaCodecInfo = std::ptr::null();
+
+        let status = unsafe {
+            AMediaCodecStore_getCodecInfo(codec_name_cstr.as_ptr(), &mut codec_info as *mut _)
+        };
+        if status != media_status_t_AMEDIA_OK || codec_info.is_null() {
+            warn!("Failed to get codec info for {}", codec_name);
+            return false;
+        }
+        unsafe {
+            AMediaCodecInfo_isFeatureSupported(codec_info, feature_name_cstr.as_ptr()) == 1
+        }
+    }
+
     fn get_next_image_impl(
         &mut self,
         payload: &[u8],
@@ -593,7 +828,7 @@ impl MediaCodec {
         category: Category,
     ) -> AvifResult<()> {
         if self.codec.is_none() {
-            self.initialize_impl(/*low_latency=*/ true)?;
+            self.initialize_impl(/*low_latency=*/ true, /*is_grid=*/ false, None)?;
         }
         let codec = self.codec.unwrap();
         if self.output_buffer_index.is_some() {
@@ -675,85 +910,118 @@ impl MediaCodec {
         payloads: &[Vec<u8>],
         grid_image_helper: &mut GridImageHelper,
     ) -> AvifResult<()> {
+        trace_method!(AtraceTag::Video);
         if self.codec.is_none() {
-            self.initialize_impl(/*low_latency=*/ false)?;
+            self.initialize_impl(
+                /*low_latency=*/ false,
+                /*is_grid=*/ true,
+                Some(grid_image_helper)
+            )?;
         }
         let codec = self.codec.unwrap();
-        let mut retry_count = 0;
-        let mut payloads_iter = payloads.iter().peekable();
-        unsafe {
-            while !grid_image_helper.is_grid_complete()? {
-                // Queue as many inputs as we possibly can, then block on dequeuing outputs. After
-                // getting each output, come back and queue the inputs again to keep the decoder as
-                // busy as possible.
-                while payloads_iter.peek().is_some() {
-                    let input_index = AMediaCodec_dequeueInputBuffer(codec, 0);
-                    if input_index < 0 {
-                        if retry_count >= Self::MAX_RETRIES {
-                            return Err(AvifError::UnknownError("max retries exceeded".into()));
-                        }
-                        break;
-                    }
-                    let payload = payloads_iter.next().unwrap();
-                    self.enqueue_payload(
-                        input_index,
-                        payload,
-                        if payloads_iter.peek().is_some() {
-                            0
-                        } else {
-                            AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32
-                        },
-                    )?;
+
+        let (input_to_output_tx, input_to_output_rx) = mpsc::channel::<ThreadMessage>();
+        let (output_to_input_tx, output_to_input_rx) = mpsc::channel::<ThreadMessage>();
+
+        let payloads_copy: Vec<Vec<u8>> = payloads.to_vec();
+        let codec_config = self.config.unwrap_ref().codec_config.clone();
+
+        let input_thread = {
+            let thread_safe_codec = ThreadSafeMediaCodec(codec);
+            thread::spawn(move || {
+                Self::input_thread_entry(
+                    thread_safe_codec,
+                    payloads_copy,
+                    input_to_output_tx,
+                    output_to_input_rx,
+                    codec_config)
+            })
+        };
+
+        let mut output_retries = 0;
+        while !grid_image_helper.is_grid_complete()? {
+            let mut buffer_info = AMediaCodecBufferInfo::default();
+            let output_index = unsafe {
+                AMediaCodec_dequeueOutputBuffer(
+                    codec,
+                    &mut buffer_info as *mut _,
+                    Self::TIMEOUT as _,
+                )
+            };
+            match output_index {
+                index if index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as isize => {
+                    continue;
                 }
-                loop {
-                    let mut buffer_info = AMediaCodecBufferInfo::default();
-                    let output_index = AMediaCodec_dequeueOutputBuffer(
-                        codec,
-                        &mut buffer_info as *mut _,
-                        Self::TIMEOUT as _,
-                    );
-                    if output_index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as isize {
-                        continue;
-                    } else if output_index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize {
-                        let format = AMediaCodec_getOutputFormat(codec);
-                        if format.is_null() {
-                            return Err(AvifError::UnknownError("output format was null".into()));
+                index if index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize => {
+                    let format = unsafe { AMediaCodec_getOutputFormat(codec) };
+                    if format.is_null() {
+                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
+                        return Err(AvifError::UnknownError("Output format was null".into()));
+                    }
+                    self.format = Some(MediaFormat { format });
+                    continue;
+                }
+                index if index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize => {
+                    output_retries += 1;
+                    if output_retries >= Self::MAX_RETRIES {
+                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
+                        return Err(AvifError::UnknownError("Output max retries exceeded".into()));
+                    }
+                    match input_to_output_rx.try_recv() {
+                        Ok(ThreadMessage::Error(e)) => {
+                            error!("Received error from input thread: {:?}", e);
+                            return Err(e);
                         }
-                        self.format = Some(MediaFormat { format });
-                        continue;
-                    } else if output_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
-                        retry_count += 1;
-                        if retry_count >= Self::MAX_RETRIES {
-                            return Err(AvifError::UnknownError("max retries exceeded".into()));
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            error!("Input thread disconnected");
+                            return Err(AvifError::UnknownError("Input thread disconnected".into()));
                         }
-                        break;
-                    } else if output_index < 0 {
-                        return Err(AvifError::UnknownError("".into()));
-                    } else {
-                        let mut buffer_size: usize = 0;
-                        let output_buffer = AMediaCodec_getOutputBuffer(
+                        Ok(ThreadMessage::ExitSignal) => { /* Shouldn't come here */ }
+                        Err(_) => { /* Nothing to do, ignore */ }
+                    }
+                    continue;
+                }
+                index if index < 0 as isize => {
+                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
+                        return Err(AvifError::UnknownError("Dequeue output buffer failed".into()));
+                }
+                index => {
+                    let mut buffer_size: usize = 0;
+                    let output_buffer = unsafe {
+                        AMediaCodec_getOutputBuffer(
                             codec,
-                            usize_from_isize(output_index)?,
+                            index as usize,
                             &mut buffer_size as *mut _,
-                        );
-                        if output_buffer.is_null() {
-                            return Err(AvifError::UnknownError("output buffer is null".into()));
-                        }
-                        let mut cell_image = Image::default();
-                        self.output_buffer_to_image(
-                            output_buffer,
-                            &mut cell_image,
-                            grid_image_helper.category,
-                        )?;
-                        grid_image_helper.copy_from_cell_image(&mut cell_image)?;
-                        if !grid_image_helper.is_grid_complete()? {
+                        )
+                    };
+
+                    if output_buffer.is_null() {
+                        error!("Output buffer is null");
+                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
+                        return Err(AvifError::UnknownError("Output buffer is null".into()));
+                    }
+
+                    let mut cell_image = Image::default();
+                    self.output_buffer_to_image(
+                        output_buffer,
+                        &mut cell_image,
+                        grid_image_helper.category,
+                    )?;
+
+                    grid_image_helper.copy_from_cell_image(&mut cell_image)?;
+
+                    if !grid_image_helper.is_grid_complete()? {
+                        unsafe {
                             // The last output buffer will be released when the codec is dropped.
-                            AMediaCodec_releaseOutputBuffer(codec, output_index as _, false);
+                            AMediaCodec_releaseOutputBuffer(codec, index as usize, false);
                         }
-                        break;
                     }
                 }
             }
+        }
+
+        if let Err(_) = input_thread.join() {
+            return Err(AvifError::UnknownError("Input thread join failed".into()));
         }
         Ok(())
     }
