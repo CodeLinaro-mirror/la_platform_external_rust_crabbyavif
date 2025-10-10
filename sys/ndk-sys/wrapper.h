@@ -15,3 +15,6 @@
  */
 
 #include <media/NdkMediaCodec.h>
+#include <media/NdkMediaCodecInfo.h>
+#include <media/NdkMediaCodecStore.h>
+
