@@ -21,6 +21,8 @@ use std::ffi::CStr;
 use std::num::NonZero;
 use std::os::raw::c_char;
 
+use atrace::{trace_method, AtraceTag};
+
 use crate::decoder::track::*;
 use crate::decoder::*;
 use crate::internal_utils::*;
@@ -120,6 +122,7 @@ fn rust_decoder_const<'a>(decoder: *const avifDecoder) -> &'a Decoder {
 /// Used by the C API to create an avifDecoder object with default values.
 #[no_mangle]
 pub unsafe extern "C" fn crabby_avifDecoderCreate() -> *mut avifDecoder {
+    init_logger();
     Box::into_raw(Box::<avifDecoder>::default())
 }
 
@@ -320,6 +323,7 @@ pub unsafe extern "C" fn crabby_avifDecoderNthImage(
     decoder: *mut avifDecoder,
     frameIndex: u32,
 ) -> avifResult {
+    trace_method!(AtraceTag::Video);
     check_pointer!(decoder);
     let rust_decoder = rust_decoder(decoder);
     rust_decoder.settings = deref_const!(decoder).into();
