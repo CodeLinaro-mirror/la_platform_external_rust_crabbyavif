@@ -318,7 +318,7 @@ pub enum CompressionFormat {
 }
 
 pub struct GridImageHelper<'a> {
-    grid: &'a Grid,
+    grid: &'a mut Grid,
     image: &'a mut Image,
     pub(crate) category: Category,
     cell_index: usize,
@@ -333,6 +333,21 @@ pub struct GridImageHelper<'a> {
 impl GridImageHelper<'_> {
     pub(crate) fn is_grid_complete(&self) -> AvifResult<bool> {
         Ok(self.cell_index as u32 == checked_mul!(self.grid.rows, self.grid.columns)?)
+    }
+
+    pub(crate) fn image_dimensions(&self) -> (u32, u32) {
+        (self.image.width, self.image.height)
+    }
+
+    pub(crate) fn is_tile_size_aligned_to(&self, alignment: u32) -> bool {
+        self.tile_width % alignment == 0 && self.tile_height % alignment == 0
+    }
+
+    pub(crate) fn update_grid_by_row(&mut self) -> AvifResult<()> {
+        self.tile_width = checked_mul!(self.tile_width, self.grid.columns)?;
+        self.grid.columns = 1;
+
+        Ok(())
     }
 
     pub(crate) fn copy_from_cell_image(&mut self, cell_image: &mut Image) -> AvifResult<()> {
@@ -1562,7 +1577,7 @@ impl Decoder {
             let data = sample.data(io, item_data_buffer)?;
             payloads.push(data.to_vec());
         }
-        let grid = &self.tile_info[category.usize()].grid;
+        let grid = &mut self.tile_info[category.usize()].grid;
         if checked_mul!(grid.rows, grid.columns)? != payloads.len() as u32 {
             return Err(AvifError::InvalidArgument);
         }
