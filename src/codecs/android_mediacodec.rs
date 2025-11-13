@@ -14,7 +14,6 @@
 
 use crate::codecs::Decoder;
 use crate::codecs::DecoderConfig;
-use crate::decoder::CodecChoice;
 use crate::decoder::GridImageHelper;
 use crate::image::Image;
 use crate::image::YuvRange;
@@ -425,11 +424,11 @@ impl MediaCodec {
     ) -> AvifResult<()> {
         let config = self.config.unwrap_ref();
         if self.codec_index >= self.codec_initializers.len() {
-            return Err(AvifError::NoCodecAvailable);
+            return AvifError::no_codec_available();
         }
         let format = unsafe { AMediaFormat_new() };
         if format.is_null() {
-            return Err(AvifError::UnknownError("".into()));
+            return AvifError::unknown_error("");
         }
         c_str!(
             mime_type,
@@ -493,7 +492,7 @@ impl MediaCodec {
         };
         if codec.is_null() {
             unsafe { AMediaFormat_delete(format) };
-            return Err(AvifError::NoCodecAvailable);
+            return AvifError::no_codec_available();
         }
 
         unsafe {
@@ -586,7 +585,7 @@ impl MediaCodec {
                 AMediaCodec_delete(codec);
                 AMediaFormat_delete(format);
             }
-            return Err(AvifError::NoCodecAvailable);
+            return AvifError::no_codec_available();
         }
         let status = unsafe { AMediaCodec_start(codec) };
         if status != media_status_t_AMEDIA_OK {
@@ -594,7 +593,7 @@ impl MediaCodec {
                 AMediaCodec_delete(codec);
                 AMediaFormat_delete(format);
             }
-            return Err(AvifError::NoCodecAvailable);
+            return AvifError::no_codec_available();
         }
         self.codec = Some(codec);
         Ok(())
@@ -607,7 +606,7 @@ impl MediaCodec {
         category: Category,
     ) -> AvifResult<()> {
         if self.format.is_none() {
-            return Err(AvifError::UnknownError("format is none".into()));
+            return AvifError::unknown_error("format is none");
         }
         let format = self.format.unwrap_ref();
         image.width = format.width()? as u32;
@@ -667,12 +666,12 @@ impl MediaCodec {
                             )
                         } != 0
                         {
-                            return Err(AvifError::ReformatFailed);
+                            return AvifError::reformat_failed();
                         }
                     }
                     #[cfg(not(feature = "libyuv"))]
                     {
-                        return Err(AvifError::NotImplemented);
+                        return AvifError::not_implemented();
                     }
                 } else {
                     for i in 0usize..3 {
@@ -728,9 +727,9 @@ impl MediaCodec {
             )
         };
         if input_buffer.is_null() {
-            return Err(AvifError::UnknownError(format!(
+            return AvifError::unknown_error(format!(
                 "input buffer at index {input_index} was null"
-            )));
+            ));
         }
 
         let hevc_whole_nal_units = Self::hevc_whole_nal_units_static(payload, codec_config)?;
@@ -739,10 +738,10 @@ impl MediaCodec {
             None => payload,
         };
         if input_buffer_size < codec_payload.len() {
-            return Err(AvifError::UnknownError(format!(
+            return AvifError::unknown_error(format!(
                 "input buffer (size {input_buffer_size}) was not big enough. required size: {}",
                 codec_payload.len()
-            )));
+            ));
         }
         unsafe {
             ptr::copy_nonoverlapping(codec_payload.as_ptr(), input_buffer, codec_payload.len());
@@ -756,7 +755,7 @@ impl MediaCodec {
                 flags,
             ) != media_status_t_AMEDIA_OK
             {
-                return Err(AvifError::UnknownError("".into()));
+                return AvifError::unknown_error("");
             }
         }
         Ok(())
@@ -896,9 +895,7 @@ impl MediaCodec {
                 } else if input_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
                     continue;
                 } else {
-                    return Err(AvifError::UnknownError(format!(
-                        "got input index < 0: {input_index}"
-                    )));
+                    return AvifError::unknown_error(format!("got input index < 0: {input_index}"));
                 }
             }
         }
@@ -921,7 +918,7 @@ impl MediaCodec {
                         &mut buffer_size as *mut _,
                     );
                     if output_buffer.is_null() {
-                        return Err(AvifError::UnknownError("output buffer is null".into()));
+                        return AvifError::unknown_error("output buffer is null");
                     }
                     buffer = Some(output_buffer);
                     self.output_buffer_index = Some(usize_from_isize(output_index)?);
@@ -931,23 +928,21 @@ impl MediaCodec {
                 } else if output_index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize {
                     let format = AMediaCodec_getOutputFormat(codec);
                     if format.is_null() {
-                        return Err(AvifError::UnknownError("output format was null".into()));
+                        return AvifError::unknown_error("output format was null");
                     }
                     self.format = Some(MediaFormat { format });
                     continue;
                 } else if output_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize {
                     continue;
                 } else {
-                    return Err(AvifError::UnknownError(format!(
+                    return AvifError::unknown_error(format!(
                         "mediacodec dequeue_output_buffer failed: {output_index}"
-                    )));
+                    ));
                 }
             }
         }
         if buffer.is_none() {
-            return Err(AvifError::UnknownError(
-                "did not get buffer from mediacodec".into(),
-            ));
+            return AvifError::unknown_error("did not get buffer from mediacodec");
         }
         self.output_buffer_to_image(buffer.unwrap(), image, category)?;
         Ok(())
@@ -967,7 +962,6 @@ impl MediaCodec {
             )?;
         }
         let codec = self.codec.unwrap();
-
         let (input_to_output_tx, input_to_output_rx) = mpsc::channel::<ThreadMessage>();
         let (output_to_input_tx, output_to_input_rx) = mpsc::channel::<ThreadMessage>();
 
@@ -1125,9 +1119,7 @@ impl Decoder for MediaCodec {
             self.drop_impl();
             self.codec_index += 1;
         }
-        Err(AvifError::UnknownError(
-            "all the codecs failed to extract an image".into(),
-        ))
+        AvifError::unknown_error("all the codecs failed to extract an image")
     }
 
     fn get_next_image_grid(
@@ -1150,9 +1142,7 @@ impl Decoder for MediaCodec {
             // supported.
             grid_image_helper.cell_index = starting_cell_index;
         }
-        Err(AvifError::UnknownError(
-            "all the codecs failed to extract an image".into(),
-        ))
+        AvifError::unknown_error("all the codecs failed to extract an image")
     }
 }
 
