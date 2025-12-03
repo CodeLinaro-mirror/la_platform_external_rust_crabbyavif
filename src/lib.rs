@@ -435,6 +435,25 @@ impl Grid {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct GridTileCache {
+    pub grid_rows: u32,
+    pub grid_columns: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub is_cached: bool,
+}
+
+impl GridTileCache {
+    pub fn cache(&mut self, grid_rows: u32, grid_columns: u32, tile_width: u32, tile_height: u32) {
+        self.grid_rows = grid_rows;
+        self.grid_columns = grid_columns;
+        self.tile_width = tile_width;
+        self.tile_height = tile_height;
+        self.is_cached = true;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Category {
     #[default]
@@ -490,6 +509,26 @@ pub struct Nclx {
 }
 
 pub const MAX_AV1_LAYER_COUNT: usize = 4;
+
+use log::{Level, LevelFilter};
+use logger::Config;
+use std::sync::Once;
+
+static LOGGER_INIT: Once = Once::new();
+
+#[inline]
+pub fn init_logger() {
+    if cfg!(target_os = "android") {
+        LOGGER_INIT.call_once(|| {
+            #[cfg(target_os = "android")]
+            let _ = logger::init(
+                Config::default()
+                .with_tag_on_device("CrabbyAvif")
+                .with_max_level(LevelFilter::Debug),
+            );
+        });
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RepetitionCount {
