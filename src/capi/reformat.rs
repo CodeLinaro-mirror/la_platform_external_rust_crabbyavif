@@ -21,6 +21,8 @@ use crate::internal_utils::*;
 use crate::reformat::rgb;
 use crate::*;
 
+use atrace::{trace_method, AtraceTag};
+
 /// cbindgen:rename-all=CamelCase
 #[repr(C)]
 pub struct avifRGBImage {
@@ -160,6 +162,7 @@ pub unsafe extern "C" fn crabby_avifImageYUVToRGB(
     image: *const avifImage,
     rgb: *mut avifRGBImage,
 ) -> avifResult {
+    trace_method!(AtraceTag::Video);
     unsafe {
         if (*image).yuvPlanes[0].is_null() {
             return avifResult::Ok;

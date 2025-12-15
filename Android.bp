@@ -109,6 +109,7 @@ rust_ffi_static {
         "libyuv",
     ],
     rustlibs: [
+        "libatrace_rust",
         "liblibyuv_sys",
         "liblog_rust",
         "liblogger",
