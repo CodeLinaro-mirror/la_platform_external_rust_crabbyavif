@@ -349,6 +349,7 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     let dav1d = String::from("c2.android.av1-dav1d.decoder");
     let gav1 = String::from("c2.android.av1.decoder");
     let hevc = String::from("c2.android.hevc.decoder");
+    let heic = String::from(MediaCodec::QTI_HEIC_DECODER);
     // As of Sep 2024, c2.android.av1.decoder is the only known decoder to support 12-bit AV1. So
     // prefer that for 12 bit images.
     let prefer_gav1 = config.depth == 12;
@@ -367,6 +368,7 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
         prefer_gav1,
     ) {
         (true, CompressionFormat::Heic, _) => vec![
+            CodecInitializer::ByName(heic),
             CodecInitializer::ByMimeType(mime_type.to_string()),
             CodecInitializer::ByName(hevc),
         ],
@@ -438,6 +440,8 @@ unsafe impl Send for MediaCodecThreadWrapper {}
 impl MediaCodec {
     const AV1_MIME: &str = "video/av01";
     const HEVC_MIME: &str = "video/hevc";
+    const HEIC_MIME: &str = "image/vnd.android.heic";
+    const QTI_HEIC_DECODER: &str = "c2.qti.heic.decoder";
     const MAX_RETRIES: u32 = 100;
     const TIMEOUT: u32 = 10000;
 
@@ -512,6 +516,11 @@ impl MediaCodec {
 
         let codec = match &self.codec_initializers[self.codec_index] {
             CodecInitializer::ByName(name) => {
+                if name == Self::QTI_HEIC_DECODER {
+                    // overwrite KEY_MIME to image/vnd.android.heic
+                    c_str!(heic_mime, heic_mime_tmp, Self::HEIC_MIME);
+                    unsafe { AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, heic_mime); }
+                }
                 c_str!(codec_name, codec_name_tmp, name.as_str());
                 unsafe { AMediaCodec_createCodecByName(codec_name) }
             }
