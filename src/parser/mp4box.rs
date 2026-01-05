@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::decoder::track::*;
+use crate::decoder::CompressionFormat;
 use crate::decoder::Extent;
 use crate::decoder::GenericIO;
 use crate::gainmap::GainMapMetadata;
@@ -69,7 +70,7 @@ impl FileTypeBox {
         brands.iter().any(|brand| self.has_brand(brand))
     }
 
-    pub(crate) fn is_avif(&self) -> bool {
+    pub(crate) fn is_supported(&self) -> bool {
         if self.needs_mini() {
             return true;
         }
@@ -85,6 +86,12 @@ impl FileTypeBox {
             "heix",
             #[cfg(feature = "heic")]
             "mif1",
+            #[cfg(feature = "heic")]
+            "msf1",
+            #[cfg(feature = "jpegxl")]
+            "hxlI",
+            #[cfg(feature = "jpegxl")]
+            "hxlS",
         ])
     }
 
@@ -97,6 +104,8 @@ impl FileTypeBox {
             "heix",
             #[cfg(feature = "heic")]
             "mif1",
+            #[cfg(feature = "jpegxl")]
+            "hxlI",
         ])
     }
 
@@ -107,6 +116,8 @@ impl FileTypeBox {
             "hevc",
             #[cfg(feature = "heic")]
             "msf1",
+            #[cfg(feature = "jpegxl")]
+            "hxlS",
         ])
     }
 
@@ -196,34 +207,51 @@ pub struct HevcCodecConfiguration {
     pub pps: Vec<u8>,
 }
 
-impl CodecConfiguration {
+#[cfg(feature = "jpegxl")]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct JpegXlCodecConfiguration {
+    // TODO: b/456440247
+}
+
+impl Av1CodecConfiguration {
     pub(crate) fn depth(&self) -> u8 {
-        match self {
-            Self::Av1(config) => match config.twelve_bit {
-                true => 12,
-                false => match config.high_bitdepth {
-                    true => 10,
-                    false => 8,
-                },
+        match self.twelve_bit {
+            true => 12,
+            false => match self.high_bitdepth {
+                true => 10,
+                false => 8,
             },
-            Self::Hevc(config) => config.bitdepth,
+        }
+    }
+    pub(crate) fn pixel_format(&self) -> PixelFormat {
+        if self.monochrome {
+            PixelFormat::Yuv400
+        } else if self.chroma_subsampling_x == 1 && self.chroma_subsampling_y == 1 {
+            PixelFormat::Yuv420
+        } else if self.chroma_subsampling_x == 1 {
+            PixelFormat::Yuv422
+        } else {
+            PixelFormat::Yuv444
+        }
+    }
+}
+
+impl CodecConfiguration {
+    pub(crate) fn depth(&self) -> Option<u8> {
+        match self {
+            Self::Av1(config) => Some(config.depth()),
+            Self::Hevc(config) => Some(config.bitdepth),
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => None,
         }
     }
 
-    pub(crate) fn pixel_format(&self) -> PixelFormat {
+    pub(crate) fn pixel_format(&self) -> Option<PixelFormat> {
         match self {
-            Self::Av1(config) => {
-                if config.monochrome {
-                    PixelFormat::Yuv400
-                } else if config.chroma_subsampling_x == 1 && config.chroma_subsampling_y == 1 {
-                    PixelFormat::Yuv420
-                } else if config.chroma_subsampling_x == 1 {
-                    PixelFormat::Yuv422
-                } else {
-                    PixelFormat::Yuv444
-                }
-            }
-            Self::Hevc(config) => config.pixel_format,
+            Self::Av1(config) => Some(config.pixel_format()),
+            Self::Hevc(config) => Some(config.pixel_format),
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => None,
         }
     }
 
@@ -235,6 +263,11 @@ impl CodecConfiguration {
                 // the only format that android_mediacodec returns.
                 // TODO: b/370549923 - Identify the correct chroma sample position from the codec
                 // configuration data.
+                ChromaSamplePosition::default()
+            }
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => {
+                // TODO: b/456440247 - Return None instead. The information should be fetched from pixi.
                 ChromaSamplePosition::default()
             }
         }
@@ -258,6 +291,8 @@ impl CodecConfiguration {
                 }
                 data
             }
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => unreachable!(),
         }
     }
 
@@ -269,23 +304,26 @@ impl CodecConfiguration {
                 // data.
                 0
             }
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => unreachable!(),
         }
     }
 
     #[cfg(feature = "android_mediacodec")]
     pub(crate) fn nal_length_size(&self) -> u8 {
         match self {
-            Self::Av1(_) => 0, // Unused. This function is only used for HEVC.
             Self::Hevc(config) => config.nal_length_size,
+            _ => 0, // Unused. This function is only used for HEVC.
         }
     }
 
-    pub(crate) fn is_avif(&self) -> bool {
-        matches!(self, Self::Av1(_))
-    }
-
-    pub(crate) fn is_heic(&self) -> bool {
-        matches!(self, Self::Hevc(_))
+    pub(crate) fn compression_format(&self) -> CompressionFormat {
+        match self {
+            Self::Av1(_) => CompressionFormat::Avif,
+            Self::Hevc(_) => CompressionFormat::Heic,
+            #[cfg(feature = "jpegxl")]
+            Self::JpegXl(_) => CompressionFormat::JpegXl,
+        }
     }
 }
 
@@ -300,6 +338,8 @@ pub enum ColorInformation {
 pub enum CodecConfiguration {
     Av1(Av1CodecConfiguration),
     Hevc(HevcCodecConfiguration),
+    #[cfg(feature = "jpegxl")]
+    JpegXl(JpegXlCodecConfiguration),
 }
 
 impl Default for CodecConfiguration {
@@ -871,6 +911,16 @@ fn parse_hvcC(stream: &mut IStream) -> AvifResult<ItemProperty> {
     )))
 }
 
+#[allow(non_snake_case)]
+#[cfg(feature = "jpegxl")]
+fn parse_jxlC(_stream: &mut IStream) -> AvifResult<ItemProperty> {
+    Ok(ItemProperty::CodecConfiguration(
+        CodecConfiguration::JpegXl(JpegXlCodecConfiguration {
+            // TODO: b/456440247
+        }),
+    ))
+}
+
 fn parse_colr(stream: &mut IStream) -> AvifResult<ItemProperty> {
     // Section 12.1.5.2 of ISO/IEC 14496-12.
 
@@ -1063,6 +1113,8 @@ fn parse_ipco(stream: &mut IStream, is_track: bool) -> AvifResult<Vec<ItemProper
             "clli" => properties.push(parse_clli(&mut sub_stream)?),
             #[cfg(feature = "heic")]
             "hvcC" => properties.push(parse_hvcC(&mut sub_stream)?),
+            #[cfg(feature = "jpegxl")]
+            "hxlC" => properties.push(parse_jxlC(&mut sub_stream)?),
             _ => properties.push(ItemProperty::Unknown(header.box_type)),
         }
     }
@@ -1924,7 +1976,7 @@ pub(crate) fn parse(io: &mut GenericIO) -> AvifResult<AvifBoxes> {
                 match header.box_type.as_str() {
                     "ftyp" => {
                         ftyp = Some(parse_ftyp(&mut box_stream)?);
-                        if !ftyp.unwrap_ref().is_avif() {
+                        if !ftyp.unwrap_ref().is_supported() {
                             return AvifError::invalid_ftyp();
                         }
                     }
@@ -2014,7 +2066,7 @@ pub(crate) fn peek_compatible_file_type(data: &[u8]) -> AvifResult<bool> {
         let mut header_stream = stream.sub_stream(&header.size)?;
         parse_ftyp(&mut header_stream)?
     };
-    Ok(ftyp.is_avif())
+    Ok(ftyp.is_supported())
 }
 
 pub(crate) fn parse_tmap(stream: &mut IStream) -> AvifResult<GainMapMetadata> {

@@ -24,6 +24,9 @@ pub mod android_mediacodec;
 #[cfg(feature = "aom")]
 pub mod aom;
 
+#[cfg(feature = "jpegxl")]
+pub mod libjxl;
+
 use crate::decoder::GridImageHelper;
 use crate::image::Image;
 use crate::parser::mp4box::CodecConfiguration;
@@ -64,6 +67,7 @@ pub(crate) trait Decoder {
         spatial_id: u8,
         image: &mut Image,
         category: Category,
+        #[cfg(feature = "android_mediacodec")] signal_eos: bool,
     ) -> AvifResult<()>;
     // Decode a list of input images and outputs them into the |grid_image_helper|.
     fn get_next_image_grid(
