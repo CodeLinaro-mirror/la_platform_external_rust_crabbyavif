@@ -14,6 +14,7 @@
 
 use crate::codecs::Decoder;
 use crate::codecs::DecoderConfig;
+use crate::decoder::item::Item;
 use crate::decoder::CompressionFormat;
 use crate::decoder::GridImageHelper;
 use crate::image::Image;
@@ -825,7 +826,7 @@ impl MediaCodec {
                 } else {
                     match output_rx.try_recv() {
                         Ok(ThreadMessage::ExitSignal) => {
-                            info!("Input thread received exit signal, terminating");
+                            info!("Input thread received exit signal(Main thread exception)");
                             return Ok(());
                         }
                         Ok(ThreadMessage::Error(e)) => {
@@ -839,6 +840,20 @@ impl MediaCodec {
                         Err(_) => { /* Nothing to do, ignore */ }
                     }
                 }
+            }
+        }
+        // Wait for the exit signal from the main thread.
+        loop {
+            match output_rx.recv() {
+                Ok(ThreadMessage::ExitSignal) => {
+                    info!("Input thread received exit signal (Normal)");
+                    break;
+                }
+                Err(_) => {
+                    info!("Main thread disconnected (Normal)");
+                    break;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1207,6 +1222,8 @@ impl MediaCodec {
             }
         }
 
+        // Output thread finished processing, notify the input thread to exit.
+        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
         if let Err(_) = input_thread.join() {
             return Err(AvifError::UnknownError("Input thread join failed".into()));
         }
@@ -1254,6 +1271,7 @@ impl Decoder for MediaCodec {
         spatial_id: u8,
         image: &mut Image,
         category: Category,
+        _item: Option<&Item>,
         signal_eos: bool,
     ) -> AvifResult<()> {
         while self.codec_index < self.codec_initializers.len() {

@@ -22,6 +22,7 @@ use std::num::NonZero;
 use std::os::raw::c_char;
 
 use atrace::{trace_method, AtraceTag};
+use log::{info, debug, warn, error};
 
 use crate::decoder::track::*;
 use crate::decoder::*;
@@ -283,6 +284,7 @@ pub unsafe extern "C" fn crabby_avifDecoderParse(decoder: *mut avifDecoder) -> a
     let res = rust_decoder.parse();
     deref_mut!(decoder).diag.set_from_result(&res);
     if res.is_err() {
+        error!("Failed to parse image file");
         return res.into();
     }
     rust_decoder_to_avifDecoder(rust_decoder, deref_mut!(decoder));
