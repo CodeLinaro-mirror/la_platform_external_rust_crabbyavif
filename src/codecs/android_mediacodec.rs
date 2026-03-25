@@ -362,16 +362,32 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     let prefer_hw = false;
     #[cfg(android_soong)]
     let prefer_hw = prefer_hardware_decoder(config);
+
+    let requires_decoder_conversion = config.depth > 8 &&
+        (config.android_mediacodec_output_color_format as i32)
+            == (AndroidMediaCodecOutputColorFormat::Yuv420Flexible as i32);
+
     match (
         prefer_hw,
         config.codec_config.compression_format(),
         prefer_gav1,
     ) {
-        (true, CompressionFormat::Heic, _) => vec![
-            CodecInitializer::ByName(heic),
-            CodecInitializer::ByMimeType(mime_type.to_string()),
-            CodecInitializer::ByName(hevc),
-        ],
+        (true, CompressionFormat::Heic, _) => {
+            // QCOM HEIC decoder is non-pipelined and does not support color conversion;
+            // 10-bit to 8-bit decode requests fall back to the generic HEVC decoder.
+            if requires_decoder_conversion {
+                 vec![
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                    CodecInitializer::ByName(hevc),
+                 ]
+            } else {
+                vec![
+                    CodecInitializer::ByName(heic),
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                    CodecInitializer::ByName(hevc),
+                ]
+            }
+        },
         (false, CompressionFormat::Heic, _) => vec![
             CodecInitializer::ByName(hevc),
             CodecInitializer::ByMimeType(mime_type.to_string()),
