@@ -794,6 +794,26 @@ impl MediaCodec {
         let last_payload_index = payloads.len() - 1;
         for (payload_index, payload) in payloads.iter().enumerate() {
             loop {
+                // Check for exit/error signal before every dequeueInputBuffer call.
+                // Previously the check was only in the else branch (when no input buffer
+                // was available), so a signal could be missed for many iterations while
+                // the codec kept handing out valid slots. Moving the check here bounds
+                // the worst-case response latency to one TIMEOUT (10 ms).
+                match output_rx.try_recv() {
+                    Ok(ThreadMessage::ExitSignal) => {
+                        info!("Input thread received exit signal");
+                        return Ok(());
+                    }
+                    Ok(ThreadMessage::Error(e)) => {
+                        error!("Input thread received error signal: {:?}", e);
+                        return Err(e);
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error!("Main thread disconnected");
+                        return Err(AvifError::UnknownError("Main thread disconnected".into()));
+                    }
+                    Err(_) => { /* channel empty, continue */ }
+                }
                 let input_index = unsafe {
                     AMediaCodec_dequeueInputBuffer(codec_ptr, Self::TIMEOUT as _)
                 };
@@ -812,23 +832,9 @@ impl MediaCodec {
                         return Err(AvifError::UnknownError("Failed to enqueue payload".into()));
                     }
                     break;
-                } else {
-                    match output_rx.try_recv() {
-                        Ok(ThreadMessage::ExitSignal) => {
-                            info!("Input thread received exit signal(Main thread exception)");
-                            return Ok(());
-                        }
-                        Ok(ThreadMessage::Error(e)) => {
-                            error!("Input thread received error signal: {:?}", e);
-                            return Err(e);
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            error!("Main thread disconnected");
-                            return Err(AvifError::UnknownError("Main thread disconnected".into()));
-                        }
-                        Err(_) => { /* Nothing to do, ignore */ }
-                    }
                 }
+                // dequeueInputBuffer returned TRY_AGAIN_LATER or an error; loop and
+                // re-check the exit signal before retrying.
             }
         }
         // Wait for the exit signal from the main thread.
@@ -917,6 +923,9 @@ impl MediaCodec {
             unsafe {
                 AMediaCodec_releaseOutputBuffer(codec, self.output_buffer_index.unwrap(), false);
             }
+            // Reset immediately to prevent drop_impl() from releasing the same buffer
+            // a second time if this function returns an error before assigning a new index.
+            self.output_buffer_index = None;
         }
         let mut retry_count = 0;
         unsafe {
@@ -1129,6 +1138,34 @@ impl MediaCodec {
             })
         };
 
+        let output_result = self.dequeue_grid_output(
+            codec,
+            grid_image_helper,
+            &input_to_output_rx,
+        );
+
+        // Always notify the input thread to exit and join it before returning,
+        // regardless of success or failure. Dropping a JoinHandle detaches the thread
+        // (it keeps running), so any early return without joining could leave the input
+        // thread accessing a freed codec pointer after drop_impl() runs (UAF/SIGSEGV).
+        // If both output and join fail, report the output error as the root cause.
+        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
+        if let Err(_) = input_thread.join() {
+            if output_result.is_ok() {
+                return Err(AvifError::UnknownError("Input thread join failed".into()));
+            }
+        }
+        output_result
+    }
+
+    // Extracted from get_next_image_grid_impl so all return paths (success and error)
+    // converge at a single join point in the caller, preventing input thread leaks.
+    fn dequeue_grid_output(
+        &mut self,
+        codec: *mut AMediaCodec,
+        grid_image_helper: &mut GridImageHelper,
+        input_to_output_rx: &mpsc::Receiver<ThreadMessage>,
+    ) -> AvifResult<()> {
         let mut output_retries = 0;
         while !grid_image_helper.is_grid_complete()? {
             let mut buffer_info = AMediaCodecBufferInfo::default();
@@ -1146,7 +1183,6 @@ impl MediaCodec {
                 index if index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as isize => {
                     let format = unsafe { AMediaCodec_getOutputFormat(codec) };
                     if format.is_null() {
-                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
                         return Err(AvifError::UnknownError("Output format was null".into()));
                     }
                     self.format = Some(MediaFormat { format });
@@ -1155,7 +1191,6 @@ impl MediaCodec {
                 index if index == AMEDIACODEC_INFO_TRY_AGAIN_LATER as isize => {
                     output_retries += 1;
                     if output_retries >= Self::MAX_RETRIES {
-                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
                         return Err(AvifError::UnknownError("Output max retries exceeded".into()));
                     }
                     match input_to_output_rx.try_recv() {
@@ -1173,8 +1208,7 @@ impl MediaCodec {
                     continue;
                 }
                 index if index < 0 as isize => {
-                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
-                        return Err(AvifError::UnknownError("Dequeue output buffer failed".into()));
+                    return Err(AvifError::UnknownError("Dequeue output buffer failed".into()));
                 }
                 index => {
                     let mut buffer_size: usize = 0;
@@ -1188,7 +1222,6 @@ impl MediaCodec {
 
                     if output_buffer.is_null() {
                         error!("Output buffer is null");
-                        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
                         return Err(AvifError::UnknownError("Output buffer is null".into()));
                     }
 
@@ -1209,12 +1242,6 @@ impl MediaCodec {
                     }
                 }
             }
-        }
-
-        // Output thread finished processing, notify the input thread to exit.
-        let _ = output_to_input_tx.send(ThreadMessage::ExitSignal);
-        if let Err(_) = input_thread.join() {
-            return Err(AvifError::UnknownError("Input thread join failed".into()));
         }
         Ok(())
     }
