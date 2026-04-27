@@ -557,9 +557,15 @@ impl MediaCodec {
                     qti_heif_mode_str_tmp,
                     "vendor.qti-ext-dec-heif-mode.value"
                 );
+                // Workaround: row-mode (mode 2) triggers SMMU faults when image
+                // dimensions exceed 32256px. Fall back to tile-mode (mode 1) until
+                // the FW/driver buffer-size contract for row-mode is fixed.
+                const ROW_MODE_MAX_DIM: u32 = 32256;
                 let heif_mode = {
+                    let (img_w, img_h) = helper.image_dimensions();
                     let mut name_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
-                    if helper.is_tile_size_aligned_to(512) &&
+                    if img_w <= ROW_MODE_MAX_DIM && img_h <= ROW_MODE_MAX_DIM &&
+                            helper.is_tile_size_aligned_to(512) &&
                             AMediaCodec_getName(codec, &mut name_ptr) == media_status_t_AMEDIA_OK &&
                             !name_ptr.is_null() {
                         let codec_name = CStr::from_ptr(name_ptr).to_str().unwrap();
