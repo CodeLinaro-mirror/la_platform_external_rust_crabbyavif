@@ -99,7 +99,7 @@ impl Image {
         self.depth = src.depth;
         self.yuv_format = src.yuv_format;
         if src.has_plane(Plane::Y) || src.has_plane(Plane::A) {
-            if src.width > 16384 || src.height > 16384 {
+            if src.width > 32768 || src.height > 32768 {
                 return AvifError::not_implemented();
             }
             if src.has_plane(Plane::Y) && category != Category::Alpha {
