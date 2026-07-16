@@ -530,6 +530,15 @@ impl MediaCodec {
         }
 
         unsafe {
+            if config.codec_config.compression_format() == CompressionFormat::Avif {
+                c_str!(
+                    qti_image_mode_str,
+                    qti_image_mode_str_tmp,
+                    "vendor.qti-ext-image-mode.value"
+                );
+                AMediaFormat_setInt32(format, qti_image_mode_str, 1);
+                info!("Setting AVIF image mode");
+            }
             if !is_grid {
                 // No grid mode, single tile
                 c_str!(
@@ -607,10 +616,10 @@ impl MediaCodec {
                     );
                     AMediaFormat_setInt32(format, qti_heif_res_width_str, width as i32);
                     AMediaFormat_setInt32(format, qti_heif_res_height_str, height as i32);
-                    info!("Setting HEIF mode {} resolution {}x{}", heif_mode as i32, width, height);
+                    info!("Setting HEIF image mode {} resolution {}x{}", heif_mode as i32, width, height);
                     helper.update_grid_tile_for_row_mode();
                 } else {
-                    info!("Setting HEIF mode {}", heif_mode as i32);
+                    info!("Setting HEIF image mode {}", heif_mode as i32);
                     // Possibly fallback to non-ROW mode decoder after ROW mode decoding failure.
                     // Reset grid_image_helper to initial values if cached, as ROW mode modified it.
                     helper.reset_grid_tile_if_cached();
