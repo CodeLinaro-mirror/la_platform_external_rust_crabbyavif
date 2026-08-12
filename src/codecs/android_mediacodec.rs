@@ -30,6 +30,7 @@ use log::{info, debug, warn, error};
 
 use ndk_sys::bindings::*;
 
+use std::collections::HashSet;
 use std::ffi::{CString, CStr};
 use std::os::raw::c_char;
 use std::ptr;
@@ -38,6 +39,7 @@ use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::TryRecvError;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 #[cfg(android_soong)]
@@ -407,6 +409,10 @@ enum HeifMode {
 
 // row-by-row decode feature name constant
 const FEATURE_ROW_BY_ROW: &str = "heic-row-by-row-decode";
+
+// Codec features known to be supported, keyed by "codec/feature". Also guards
+// AMediaCodecStore_getCodecInfo(), whose lazy init is not thread safe.
+static SUPPORTED_FEATURES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 // Messages for thread communication in grid decoding
 #[derive(Debug)]
@@ -911,9 +917,28 @@ impl MediaCodec {
         // Therefore, this function relies on an AOSP change to add vendor feature into AOSP.
         // Another potential solution is to introduce the jni crate and query detailed vendor
         // capability infos through Java APIs, but this requires more changes.
-        let codec_name_cstr = CString::new(codec_name).unwrap();
-        let feature_name_cstr = CString::new(feature_name).unwrap();
+        let Ok(codec_name_cstr) = CString::new(codec_name) else {
+            return false;
+        };
+        let Ok(feature_name_cstr) = CString::new(feature_name) else {
+            return false;
+        };
         let mut codec_info: *const AMediaCodecInfo = std::ptr::null();
+
+        // NdkMediaCodecStore.cpp lazily builds process-global containers behind a bare
+        // `if (empty())` check with no synchronization, so concurrent decode threads can both
+        // enter initCodecInfoMap() and corrupt the same map. Hold the lock across the query;
+        // do not add a lock-free fast path over the cache.
+        let cache = SUPPORTED_FEATURES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Capabilities come from media_codecs*.xml and are fixed for this boot, so a supported
+        // result can be cached. Anything else is re-queried, since a negative may only mean the
+        // codec info map was not fully built yet.
+        let key = format!("{codec_name}/{feature_name}");
+        if cache.contains(&key) {
+            return true;
+        }
 
         let status = unsafe {
             AMediaCodecStore_getCodecInfo(codec_name_cstr.as_ptr(), &mut codec_info as *mut _)
@@ -922,9 +947,13 @@ impl MediaCodec {
             warn!("Failed to get codec info for {}", codec_name);
             return false;
         }
-        unsafe {
+        let supported = unsafe {
             AMediaCodecInfo_isFeatureSupported(codec_info, feature_name_cstr.as_ptr()) == 1
+        };
+        if supported {
+            cache.insert(key);
         }
+        supported
     }
 
     fn get_next_image_impl(
