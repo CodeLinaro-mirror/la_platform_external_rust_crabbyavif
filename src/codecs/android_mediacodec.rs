@@ -351,6 +351,7 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
     let dav1d = String::from("c2.android.av1-dav1d.decoder");
     let hevc = String::from("c2.android.hevc.decoder");
     let heic = String::from(MediaCodec::QTI_HEIC_DECODER);
+    let avif = String::from(MediaCodec::QTI_AVIF_DECODER);
     let mime_type = match config.codec_config.compression_format() {
         CompressionFormat::Avif => MediaCodec::AV1_MIME,
         CompressionFormat::Heic => MediaCodec::HEVC_MIME,
@@ -385,14 +386,36 @@ fn get_codec_initializers(config: &DecoderConfig) -> Vec<CodecInitializer> {
             CodecInitializer::ByName(hevc),
             CodecInitializer::ByMimeType(mime_type.to_string()),
         ],
-        (true, CompressionFormat::Avif) => vec![
-            CodecInitializer::ByMimeType(mime_type.to_string()),
-            CodecInitializer::ByName(dav1d),
-        ],
-        (false, CompressionFormat::Avif) => vec![
-            CodecInitializer::ByName(dav1d),
-            CodecInitializer::ByMimeType(mime_type.to_string()),
-        ],
+        (true, CompressionFormat::Avif) => {
+            // QCOM AVIF decoder is non-pipelined and does not support color conversion;
+            // High bit-depth to 8-bit decode requests fall back to generic AV1 decoders.
+            if requires_decoder_conversion {
+                vec![
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                    CodecInitializer::ByName(dav1d),
+                ]
+            } else {
+                vec![
+                    CodecInitializer::ByName(avif),
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                    CodecInitializer::ByName(dav1d),
+                ]
+            }
+        },
+        (false, CompressionFormat::Avif) => {
+            if requires_decoder_conversion {
+                vec![
+                    CodecInitializer::ByName(dav1d),
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                ]
+            } else {
+                vec![
+                    CodecInitializer::ByName(avif),
+                    CodecInitializer::ByName(dav1d),
+                    CodecInitializer::ByMimeType(mime_type.to_string()),
+                ]
+            }
+        },
         #[cfg(feature = "jpegxl")]
         (_, CompressionFormat::JpegXl) => unreachable!(),
     }
@@ -440,8 +463,10 @@ unsafe impl Send for MediaCodecThreadWrapper {}
 
 impl MediaCodec {
     const AV1_MIME: &str = "video/av01";
+    const AVIF_MIME: &str = "image/avif";
     const HEVC_MIME: &str = "video/hevc";
     const HEIC_MIME: &str = "image/vnd.android.heic";
+    const QTI_AVIF_DECODER: &str = "c2.qti.avif.decoder";
     const QTI_HEIC_DECODER: &str = "c2.qti.heic.decoder";
     const MAX_RETRIES: u32 = 100;
     const TIMEOUT: u32 = 10000;
@@ -521,6 +546,10 @@ impl MediaCodec {
                     // overwrite KEY_MIME to image/vnd.android.heic
                     c_str!(heic_mime, heic_mime_tmp, Self::HEIC_MIME);
                     unsafe { AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, heic_mime); }
+                } else if name == Self::QTI_AVIF_DECODER {
+                    // overwrite KEY_MIME to image/avif
+                    c_str!(avif_mime, avif_mime_tmp, Self::AVIF_MIME);
+                    unsafe { AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, avif_mime); }
                 }
                 c_str!(codec_name, codec_name_tmp, name.as_str());
                 unsafe { AMediaCodec_createCodecByName(codec_name) }
@@ -536,6 +565,15 @@ impl MediaCodec {
         }
 
         unsafe {
+            if config.codec_config.compression_format() == CompressionFormat::Avif {
+                c_str!(
+                    qti_image_mode_str,
+                    qti_image_mode_str_tmp,
+                    "vendor.qti-ext-image-mode.value"
+                );
+                AMediaFormat_setInt32(format, qti_image_mode_str, 1);
+                info!("Setting AVIF image mode");
+            }
             if !is_grid {
                 // No grid mode, single tile
                 c_str!(
@@ -613,10 +651,10 @@ impl MediaCodec {
                     );
                     AMediaFormat_setInt32(format, qti_heif_res_width_str, width as i32);
                     AMediaFormat_setInt32(format, qti_heif_res_height_str, height as i32);
-                    info!("Setting HEIF mode {} resolution {}x{}", heif_mode as i32, width, height);
+                    info!("Setting HEIF image mode {} resolution {}x{}", heif_mode as i32, width, height);
                     helper.update_grid_tile_for_row_mode();
                 } else {
-                    info!("Setting HEIF mode {}", heif_mode as i32);
+                    info!("Setting HEIF image mode {}", heif_mode as i32);
                     // Possibly fallback to non-ROW mode decoder after ROW mode decoding failure.
                     // Reset grid_image_helper to initial values if cached, as ROW mode modified it.
                     helper.reset_grid_tile_if_cached();
